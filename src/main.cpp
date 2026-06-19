@@ -1,40 +1,45 @@
 #include <Arduino.h>
-#include <esp_wifi.h>
 #include "BluetoothSerial.h" // 引入 ESP32 经典蓝牙串口库
 
-// 检查固件编译配置中是否开启了蓝牙宏
+// 健壮性检查：确保 PlatformIO 或 Arduino IDE 编译环境中开启了蓝牙宏
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth is not enabled! Please run `make menuconfig` to enable it
+#error Bluetooth is not enabled! Please enable Bluetooth in menuconfig or build flags.
 #endif
 
 #define LED_PIN 12
 
-BluetoothSerial SerialBT;    // 声明蓝牙串口对象
-volatile int currentMode = 2; // 当前模式：0-灭，1-亮，2-闪烁
+BluetoothSerial SerialBT;     // 实例化蓝牙串口对象
+volatile int currentMode = 2;  // 当前模式：0-灭，1-亮，2-闪烁（初始默认闪烁）
 
-// 核心重构：利用 Stream 引用，完美复用物理串口与蓝牙串口的输出逻辑
+/**
+ * 统一的指令处理核心函数
+ * @param cmd 接收到的单字节字符
+ * @param output 响应的目标通道（可以是 Serial 也可以是 SerialBT）
+ */
 void handleCommand(char cmd, Stream &output) {
   if (cmd >= '0' && cmd <= '2') {
     currentMode = cmd - '0';
     output.print("Switching to Mode: ");
-    output.println(currentMode);
+    output.println(currentMode); // 附带 \n，完美对齐 Golang 接收端
   }
   else if (cmd == '9') {
-    // 收到查询指令，直接向来源渠道回写当前模式号
-    output.print(currentMode);
+    // 关键对齐：必须使用 println() 发送 \n 结束符，彻底解决 Go 端的阻塞和超时
+    output.println(currentMode);
   }
 }
 
 void setup() {
-  // 1. 仍然关闭 Wi-Fi 模块以节约非必要能耗
-  esp_wifi_stop();
+  // 【核心修复 1】：强制锁定 160MHz 高性能主频
+  // 经典蓝牙对射频时钟同步要求极高，绝对不允许降频到 80MHz 或开启轻度睡眠(Light Sleep)
+  setCpuFrequencyMhz(160);
 
-  // 2. 初始化硬件物理串口
+  // 初始化硬件物理串口（用于 USB 数据线调试）
   Serial.begin(115200);
+
+  // 初始化 LED 引脚
   pinMode(LED_PIN, OUTPUT);
 
-  // 3. 初始化并启动经典蓝牙
-  // 此时底层会自动配置好 Bluedroid 协议栈，无需手动调用 esp_bt_controller_enable
+  // 初始化并启动经典蓝牙 SPP 协议栈
   if (!SerialBT.begin("ESP32-LED-Controller")) {
     Serial.println("Bluetooth initialization failed!");
   } else {
@@ -43,32 +48,42 @@ void setup() {
 }
 
 void loop() {
-  // 渠道一：监听物理硬件串口
+  // 【通道一】：监听物理硬件串口（USB 数据线）
   while (Serial.available() > 0) {
     char incomingChar = Serial.read();
     handleCommand(incomingChar, Serial);
   }
 
-  // 渠道二：监听无线蓝牙串口（逻辑完全一致）
+  // 【通道二】：监听无线蓝牙串口（Golang 客户端通过蓝牙发送的指令）
   while (SerialBT.available() > 0) {
     char incomingChar = SerialBT.read();
+
+    // 【核心修复 2：调试镜像】：将蓝牙收到的数据原样实时打印到 USB 串口
+    // 您可以一直打开 Mac 的串口监视器，如果这里有输出，说明 Go 发射信号成功；如果没输出，说明空中丢包
+    Serial.print("[Debug BT Input] Received byte: '");
+    Serial.print(incomingChar);
+    Serial.print("' (ASCII: ");
+    Serial.print((int)incomingChar);
+    Serial.println(")");
+
+    // 执行业务控制逻辑，并通过蓝牙回传结果给 Go
     handleCommand(incomingChar, SerialBT);
   }
 
-  // LED 非阻塞时间戳调度状态机
+  // 【LED 状态机】：采用毫秒级非阻塞时间戳调度，保证高频响应
   static unsigned long previousMillis = 0;
   static bool ledState = LOW;
 
   switch (currentMode) {
-  case 0:
-    digitalWrite(LED_PIN, LOW);
-    break;
+    case 0:
+      digitalWrite(LED_PIN, LOW);
+      break;
 
-  case 1:
-    digitalWrite(LED_PIN, HIGH);
-    break;
+    case 1:
+      digitalWrite(LED_PIN, HIGH);
+      break;
 
-  case 2: {
+    case 2: {
       unsigned long currentMillis = millis();
       if (currentMillis - previousMillis >= 500) {
         previousMillis = currentMillis;
@@ -76,9 +91,10 @@ void loop() {
         digitalWrite(LED_PIN, ledState);
       }
       break;
-  }
+    }
   }
 
-  // 维持 FreeRTOS 时间片轮转，防止看门狗超时，同时给蓝牙协议栈留出处理时间
+  // 【核心修复 3】：让出 10ms 时间片给 FreeRTOS 底层
+  // 经典蓝牙的后台协议栈运行在高级别的内部任务中，此延迟能确保射频握手稳定、不掉线
   vTaskDelay(pdMS_TO_TICKS(10));
 }
