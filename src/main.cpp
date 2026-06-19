@@ -18,7 +18,7 @@ QueueHandle_t serialQueue;
 TaskHandle_t QueryTaskHandle = NULL;
 
 // Core 0 任务：完全基于队列阻塞，0% CPU 空转功耗
-void queryTask(void *pvParameters) {
+[[noreturn]] void queryTask(void *pvParameters) {
   (void) pvParameters;
   char receivedChar;
 
