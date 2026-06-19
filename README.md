@@ -1,14 +1,17 @@
 # ESP32 led blink demo
 
 ESP32 dev module with LED blink / on / off , default is blink
-control via Golang cli throut serial port
+control via Golang cli throut serial port , code in cmd/cli
+```
+ ./cmd/bin/cli ?
+
+? should be 0 / 1 / 2 / 9 
+```
+control via BlueTeeth (BLE) via go cli , code in cmd/ble
 
 ```
- ./bin/esp32demo
-Usage: go run main.go [0|1|2|?]
-  0 - Mode 0 (Turn OFF LED)
-  1 - Mode 1 (Turn ON LED constantly)
-  2 - Mode 2 (Blink LED every 0.5s)
-  9 - Query current mode status
+ ./cmd/bin/ble ?
+
+? should be 0 / 1 / 2 / 9 
 ```
 
