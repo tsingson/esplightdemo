@@ -1,129 +1,82 @@
 #include <Arduino.h>
-#include <esp_bt.h>      // 控制器层 API (如 esp_bt_controller_disable)
-#include <esp_bt_main.h> // 主机层 Bluedroid API (如 esp_bluedroid_disable)
-// #include <WiFi.h>        // 显式引入 WiFi 库以修复 'WiFi' was not declared 错误
-#include <esp_pm.h>
 #include <esp_wifi.h>
 #include <esp_bt.h>
+#include <esp_bt_main.h>
+#include <esp_pm.h>
 
 #define LED_PIN 12
 
-// 共享变量与互斥锁
-int currentMode = 2;
-SemaphoreHandle_t modeMutex;
-
-// FreeRTOS 队列：用于核心 1 向核心 0 传递 '9' 指令
-QueueHandle_t serialQueue;
-
-TaskHandle_t QueryTaskHandle = NULL;
-
-// Core 0 任务：完全基于队列阻塞，0% CPU 空转功耗
-[[noreturn]] void queryTask(void *pvParameters) {
-  (void) pvParameters;
-  char receivedChar;
-
-  for (;;) {
-    // 强阻塞：如果队列里没有数据，当前核心完全挂起进入休眠
-    if (xQueueReceive(serialQueue, &receivedChar, portMAX_DELAY) == pdTRUE) {
-      if (receivedChar == '9') {
-        if (xSemaphoreTake(modeMutex, portMAX_DELAY) == pdTRUE) {
-          int modeCopy = currentMode;
-          xSemaphoreGive(modeMutex);
-
-          Serial.print(modeCopy); // 回写模式号
-        }
-      }
-    }
-  }
-}
+// 当前模式：0-灭，1-亮，2-闪烁
+// 使用 volatile 确保多任务/底层中断读取时的可见性
+volatile int currentMode = 2;
 
 void setup() {
-  // 1. 彻底关闭无线模块降功耗
-  // WiFi.mode(WIFI_OFF);
+  // 1. 彻底关闭无线模块（Wi-Fi与蓝牙），切断基础射频功耗
   esp_wifi_stop();
   esp_bluedroid_disable();
   esp_bt_controller_disable();
 
-  // 2. 降低主频至 80MHz 限制动态功耗
+  // 2. 降低 CPU 主频至 80MHz（大幅降低动态运行功耗，同时保证外设时钟稳定）
   setCpuFrequencyMhz(80);
 
   pinMode(LED_PIN, OUTPUT);
   Serial.begin(115200);
 
-  // 3. 初始化 FreeRTOS 通信组件
-  modeMutex = xSemaphoreCreateMutex();
-  serialQueue = xQueueCreate(5, sizeof(char)); // 创建容量为 5 的字符队列
+  // 3. 高级电源管理配置（若底层 sdkconfig 开启了 CONFIG_PM_ENABLE，则自动支持自动轻度睡眠）
+#if CONFIG_PM_ENABLE
+  esp_pm_config_esp32_t pm_config = {
+    .max_freq_mhz = 80,
+    .min_freq_mhz = 10,
+    .light_sleep_enable = true
+};
+  esp_pm_configure(&pm_config);
+#endif
 
-  // 4. 创建 Core 0 查询任务
-  xTaskCreatePinnedToCore(
-    queryTask,
-    "QueryTask",
-    2048,
-    NULL,
-    2,                  // 稍微提高优先级，确保响应及时
-    &QueryTaskHandle,
-    0
-  );
-
-  // 5. 高级电源管理配置（防止串口由于睡眠而死锁/乱码）
-  #if CONFIG_PM_ENABLE
-    esp_pm_config_esp32_t pm_config = {
-        .max_freq_mhz = 80,
-        .min_freq_mhz = 10,
-        .light_sleep_enable = true
-    };
-    esp_pm_configure(&pm_config);
-  #endif
-
-  Serial.println("ESP32 Ultra-Stable Low-Power Firmware Ready.");
+  Serial.println("ESP32 Cleaned & Enhanced Low-Power Firmware Ready.");
 }
 
 void loop() {
-  // 唯一数据源：由 Core 1 统一接收处理串口所有数据
-  if (Serial.available() > 0) {
+  // 【修订 1】非阻塞式串口监听：利用 while 迅速清空接收缓冲区，延迟从 500ms 降至 10ms 内
+  while (Serial.available() > 0) {
     char incomingChar = Serial.read();
 
-    if (incomingChar == '0' || incomingChar == '1' || incomingChar == '2') {
-      if (xSemaphoreTake(modeMutex, portMAX_DELAY) == pdTRUE) {
-        currentMode = incomingChar - '0';
-        int modeCopy = currentMode;
-        xSemaphoreGive(modeMutex);
-
-        Serial.print("Switching to Mode: ");
-        Serial.println(modeCopy);
-      }
+    if (incomingChar >= '0' && incomingChar <= '2') {
+      currentMode = incomingChar - '0';
+      Serial.print("Switching to Mode: ");
+      Serial.println(currentMode);
     }
     else if (incomingChar == '9') {
-      // 核心 1 收到 '9' 后，丢进队列交给核心 0
-      xQueueSend(serialQueue, &incomingChar, 0);
+      // 直接本地回写当前状态，移除原跨核心 Queue 调度，彻底消除死锁隐患
+      Serial.print(currentMode);
     }
   }
 
-  // 获取当前模式执行 LED 逻辑
-  int localMode = 2;
-  if (xSemaphoreTake(modeMutex, portMAX_DELAY) == pdTRUE) {
-    localMode = currentMode;
-    xSemaphoreGive(modeMutex);
-  }
-
-  // LED 调度状态机
+  // 【修订 2】非阻塞时间戳调度：替代原有的 vTaskDelay 强阻塞，使 loop 保持高速轮询
+  static unsigned long previousMillis = 0;
   static bool ledState = LOW;
-  switch (localMode) {
-    case 0:
-      digitalWrite(LED_PIN, LOW);
-      vTaskDelay(pdMS_TO_TICKS(50)); // 静态模式，延长挂起时间，深度睡眠
-      break;
 
-    case 1:
-      digitalWrite(LED_PIN, HIGH);
-      vTaskDelay(pdMS_TO_TICKS(50)); // 静态模式，延长挂起时间，深度睡眠
-      break;
+  switch (currentMode) {
+  case 0:
+    digitalWrite(LED_PIN, LOW);
+    break;
 
-    case 2:
-      // 改用标准的 FreeRTOS 500ms 强阻塞延时
-      ledState = !ledState;
-      digitalWrite(LED_PIN, ledState);
-      vTaskDelay(pdMS_TO_TICKS(500)); // 这 500ms 内，CPU 会进入 Light Sleep 节电状态
+  case 1:
+    digitalWrite(LED_PIN, HIGH);
+    break;
+
+  case 2: {
+      unsigned long currentMillis = millis();
+      if (currentMillis - previousMillis >= 500) {
+        previousMillis = currentMillis;
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState);
+      }
       break;
   }
+  }
+
+  // 【修订 3】自适应省电休眠：每次循环强制让出 10ms CPU 时间片。
+  // 在这 10ms 内，CPU 没有计算任务，会自动挂起并触发 Light Sleep 自动节电；
+  // 醒来后立刻以 10ms 的超高刷新率响应串口，兼顾了“极致省电”与“即时响应”。
+  vTaskDelay(pdMS_TO_TICKS(10));
 }
