@@ -10,10 +10,7 @@
 BluetoothSerial SerialBT;
 volatile int currentMode = 2;
 
-// ================================================================
-// 【核心新增】：蓝牙底层状态监听器
-// 彻底监视 Mac 是否真正与 ESP32 完成了无线的空中牵手
-// ================================================================
+// 蓝牙连接事件回调
 void bluetoothCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
   if (event == ESP_SPP_SRV_OPEN_EVT) {
     Serial.println("\n=========================================");
@@ -25,6 +22,7 @@ void bluetoothCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
   }
 }
 
+// 核心业务处理
 void handleCommand(char cmd, Stream &output) {
   if (cmd >= '0' && cmd <= '2') {
     currentMode = cmd - '0';
@@ -32,16 +30,16 @@ void handleCommand(char cmd, Stream &output) {
     output.println(currentMode);
   }
   else if (cmd == '9') {
-    output.println(currentMode);
+    output.println(currentMode); // 必须带 println，向 Go 发送 \n
   }
+  // 如果收到 \n 或 \r，这里不命中任何条件，会安全地自动忽略
 }
 
 void setup() {
-  setCpuFrequencyMhz(160); // 确保蓝牙时钟稳定
+  setCpuFrequencyMhz(160);
   Serial.begin(115200);
   pinMode(LED_PIN, OUTPUT);
 
-  // 【关键步骤】：在蓝牙启动前，注册状态监听回调函数
   SerialBT.register_callback(bluetoothCallback);
 
   if (!SerialBT.begin("ESP32-LED-Controller")) {
@@ -52,25 +50,28 @@ void setup() {
 }
 
 void loop() {
-  // 渠道一：物理串口
+  // 渠道一：物理串口调试
   while (Serial.available() > 0) {
     char incomingChar = Serial.read();
     handleCommand(incomingChar, Serial);
   }
 
-  // 渠道二：蓝牙无线串口
+  // 渠道二：无线蓝牙串口
   while (SerialBT.available() > 0) {
     char incomingChar = SerialBT.read();
 
-    // 如果有数据进来，这里一定会打印
-    Serial.print("[Debug BT Input] Received: '");
-    Serial.print(incomingChar);
-    Serial.println("'");
+    // 过滤掉不可见的换行符，避免串口监视器打印杂乱空格
+    if (incomingChar != '\n' && incomingChar != '\r') {
+      Serial.print("[Debug BT Input] Received: '");
+      Serial.print(incomingChar);
+      Serial.println("'");
+    }
 
+    // 投递给状态机执行
     handleCommand(incomingChar, SerialBT);
   }
 
-  // LED 状态机保持非阻塞轮询
+  // LED 闪烁状态机
   static unsigned long previousMillis = 0;
   static bool ledState = LOW;
   switch (currentMode) {
