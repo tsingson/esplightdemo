@@ -4,7 +4,7 @@ version.txt
 *.dll
 *.so
 *.dylib
-**/bin/
+cmd/bin/
 .idea/*
 */.idea/*
 */packages
@@ -17,7 +17,7 @@ packages/*
 .idea/
 cmd/bin/
 **/linux-bin/
-*/bin/*
+cmd/bin/*
 # Test binary, build with `go test -c`
 *.test
 
