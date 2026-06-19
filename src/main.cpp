@@ -18,12 +18,12 @@ volatile int currentMode = 2; // 默认闪烁模式
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;
-      Serial.println("\n[BLE STATUS] !!! MAC OS 成功连接 !!!");
+      Serial.println("\n[BLE STATUS] !!! MAC OS connect success !!!");
     };
 
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
-      Serial.println("\n[BLE STATUS] !!! 蓝牙已断开 !!!");
+      Serial.println("\n[BLE STATUS] !!! blueteeth disconnect !!!");
       BLEDevice::startAdvertising();
     }
 };
@@ -47,7 +47,7 @@ class MyCallbacks: public BLECharacteristicCallbacks {
 
         if (modeChanged) {
           // 1. 串口打印响应
-          Serial.println("[->] 模式切换成功！响应代码: 9");
+          Serial.println("[->] mode switch success, response: 9");
 
           // 2. 向 BLE 无线回传数字 9 (带换行符以保持流整洁)
           const char* successResponse = "9\n";
@@ -61,7 +61,7 @@ class MyCallbacks: public BLECharacteristicCallbacks {
 
           pTxCharacteristic->setValue((uint8_t*)responseMsg, strlen(responseMsg));
           pTxCharacteristic->notify();
-          Serial.print("[->] 查询状态成功！已返回当前模式: ");
+          Serial.print("[->]  query status succes, responce: ");
           Serial.println(currentMode);
         }
       }
@@ -93,7 +93,7 @@ void setup() {
 
   pService->start();
   pServer->getAdvertising()->start();
-  Serial.println("[*] BLE 串口服务已就绪，等待 Mac 控制...");
+  Serial.println("[*] BLE serial port services ready, wait for  Mac control...");
 }
 
 void loop() {
