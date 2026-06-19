@@ -1,70 +1,108 @@
 #include <Arduino.h>
-#include <esp_wifi.h>
-#include <esp_bt.h>
-#include <esp_bt_main.h>
-#include <esp_pm.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
 #define LED_PIN 12
 
-// 当前模式：0-灭，1-亮，2-闪烁
-// 使用 volatile 确保多任务/底层中断读取时的可见性
-volatile int currentMode = 2;
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define RX_CHARACTERISTIC_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define TX_CHARACTERISTIC_UUID "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+BLEServer *pServer = NULL;
+BLECharacteristic *pTxCharacteristic;
+bool deviceConnected = false;
+volatile int currentMode = 2; // 默认闪烁模式
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("\n[BLE STATUS] !!! MAC OS 成功连接 !!!");
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("\n[BLE STATUS] !!! 蓝牙已断开 !!!");
+      BLEDevice::startAdvertising();
+    }
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String rxValue = pCharacteristic->getValue().c_str();
+
+      if (rxValue.length() > 0) {
+        Serial.print("[Debug BLE Input] Received Command: ");
+        Serial.println(rxValue);
+
+        bool modeChanged = false;
+
+        // ================================================================
+        // 【新逻辑】：解析 0, 1, 2 指令并拦截
+        // ================================================================
+        if (rxValue.indexOf('0') != -1) { currentMode = 0; modeChanged = true; }
+        else if (rxValue.indexOf('1') != -1) { currentMode = 1; modeChanged = true; }
+        else if (rxValue.indexOf('2') != -1) { currentMode = 2; modeChanged = true; }
+
+        if (modeChanged) {
+          // 1. 串口打印响应
+          Serial.println("[->] 模式切换成功！响应代码: 9");
+
+          // 2. 向 BLE 无线回传数字 9 (带换行符以保持流整洁)
+          const char* successResponse = "9\n";
+          pTxCharacteristic->setValue((uint8_t*)successResponse, strlen(successResponse));
+          pTxCharacteristic->notify();
+        }
+        // 保留原逻辑：如果收到 '9'，则返回当前的实际模式数字 (0, 1 或 2)
+        else if (rxValue.indexOf('9') != -1) {
+          char responseMsg[10];
+          snprintf(responseMsg, sizeof(responseMsg), "%d\n", currentMode);
+
+          pTxCharacteristic->setValue((uint8_t*)responseMsg, strlen(responseMsg));
+          pTxCharacteristic->notify();
+          Serial.print("[->] 查询状态成功！已返回当前模式: ");
+          Serial.println(currentMode);
+        }
+      }
+    }
+};
 
 void setup() {
-  // 1. 彻底关闭无线模块（Wi-Fi与蓝牙），切断基础射频功耗
-  esp_wifi_stop();
-  esp_bluedroid_disable();
-  esp_bt_controller_disable();
-
-  // 2. 降低 CPU 主频至 80MHz（大幅降低动态运行功耗，同时保证外设时钟稳定）
-  setCpuFrequencyMhz(80);
-
-  pinMode(LED_PIN, OUTPUT);
   Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  setCpuFrequencyMhz(160);
 
-  // 3. 高级电源管理配置（若底层 sdkconfig 开启了 CONFIG_PM_ENABLE，则自动支持自动轻度睡眠）
-#if CONFIG_PM_ENABLE
-  esp_pm_config_esp32_t pm_config = {
-    .max_freq_mhz = 80,
-    .min_freq_mhz = 10,
-    .light_sleep_enable = true
-};
-  esp_pm_configure(&pm_config);
-#endif
+  BLEDevice::init("ESP32-BLE-Controller");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
 
-  Serial.println("ESP32 Cleaned & Enhanced Low-Power Firmware Ready.");
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pTxCharacteristic = pService->createCharacteristic(
+                      TX_CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
+                       RX_CHARACTERISTIC_UUID,
+                       BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+                     );
+  pRxCharacteristic->setCallbacks(new MyCallbacks());
+
+  pService->start();
+  pServer->getAdvertising()->start();
+  Serial.println("[*] BLE 串口服务已就绪，等待 Mac 控制...");
 }
 
 void loop() {
-  // 【修订 1】非阻塞式串口监听：利用 while 迅速清空接收缓冲区，延迟从 500ms 降至 10ms 内
-  while (Serial.available() > 0) {
-    char incomingChar = Serial.read();
-
-    if (incomingChar >= '0' && incomingChar <= '2') {
-      currentMode = incomingChar - '0';
-      Serial.print("Switching to Mode: ");
-      Serial.println(currentMode);
-    }
-    else if (incomingChar == '9') {
-      // 直接本地回写当前状态，移除原跨核心 Queue 调度，彻底消除死锁隐患
-      Serial.print(currentMode);
-    }
-  }
-
-  // 【修订 2】非阻塞时间戳调度：替代原有的 vTaskDelay 强阻塞，使 loop 保持高速轮询
   static unsigned long previousMillis = 0;
   static bool ledState = LOW;
-
   switch (currentMode) {
-  case 0:
-    digitalWrite(LED_PIN, LOW);
-    break;
-
-  case 1:
-    digitalWrite(LED_PIN, HIGH);
-    break;
-
-  case 2: {
+    case 0: digitalWrite(LED_PIN, LOW); break;
+    case 1: digitalWrite(LED_PIN, HIGH); break;
+    case 2: {
       unsigned long currentMillis = millis();
       if (currentMillis - previousMillis >= 500) {
         previousMillis = currentMillis;
@@ -72,11 +110,7 @@ void loop() {
         digitalWrite(LED_PIN, ledState);
       }
       break;
+    }
   }
-  }
-
-  // 【修订 3】自适应省电休眠：每次循环强制让出 10ms CPU 时间片。
-  // 在这 10ms 内，CPU 没有计算任务，会自动挂起并触发 Light Sleep 自动节电；
-  // 醒来后立刻以 10ms 的超高刷新率响应串口，兼顾了“极致省电”与“即时响应”。
-  vTaskDelay(pdMS_TO_TICKS(10));
+  delay(10);
 }
